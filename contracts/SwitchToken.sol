@@ -15,12 +15,13 @@ description: Cross-chain liquidity built for traders.
 website: https://polkaswitch.com/
 telegram: https://t.me/polkaswitchANN
 */
+// SPDX-License-Identifier: MIT
+pragma solidity 0.6.12;
+
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20Burnable.sol";
 import "@openzeppelin/contracts/math/SafeMath.sol";
-
-pragma solidity 0.6.12;
 
 // SwitchToken with Governance and adds a cap to the supply of tokens..
 contract Switch is IERC20, Ownable {
@@ -81,6 +82,20 @@ contract Switch is IERC20, Ownable {
 
     /// @notice The standard EIP-20 approval event
     event Approval(address indexed owner, address indexed spender, uint256 amount);
+
+    uint256 public constant TAX_PERCENT = 5; // 5% tax on transfers
+    uint256 public constant BURN_PERCENT = 2; // 2% of tax goes to burn
+    uint256 public constant REFLECTION_PERCENT = 3; // 3% of tax goes to reflection
+
+    uint256 public cooldownTime = 60; // 60 seconds cooldown for anti-bot
+    mapping(address => uint256) private _lastTransferTime;
+
+    uint96 private _totalSupplyForReflection;
+    mapping(address => bool) private _excludedFromReflection;
+
+    event TaxTaken(address from, address to, uint256 amount, uint256 tax);
+    event Burned(uint256 amount);
+    event Reflected(uint256 amount);
 
     /// @notice Creates `_amount` token to `_to`. Must only be called by the owner.
     function mint(address _to, uint _rawAmount) external onlyOwner {
@@ -169,7 +184,10 @@ contract Switch is IERC20, Ownable {
      * @return The number of tokens held
      */
     function balanceOf(address account) external override view returns (uint) {
-        return _balances[account];
+        if (_excludedFromReflection[account]) {
+            return _balances[account];
+        }
+        return uint256(_balances[account]) * uint256(_totalSupply) / uint256(_totalSupplyForReflection);
     }
 
     /**
@@ -327,11 +345,38 @@ contract Switch is IERC20, Ownable {
         require(src != address(0), "SWITCH::_transferTokens: cannot transfer from the zero address");
         require(dst != address(0), "SWITCH::_transferTokens: cannot transfer to the zero address");
 
-        _balances[src] = sub96(_balances[src], amount, "SWITCH::_transferTokens: transfer amount exceeds balance");
-        _balances[dst] = add96(_balances[dst], amount, "SWITCH::_transferTokens: transfer amount overflows");
-        emit Transfer(src, dst, amount);
+        // Anti-bot: Check cooldown
+        require(block.timestamp >= _lastTransferTime[src] + cooldownTime, "Anti-bot: Transfer cooldown active");
+        _lastTransferTime[src] = block.timestamp;
+        _lastTransferTime[dst] = block.timestamp; // Also set for recipient to prevent immediate resell
 
-        _moveDelegates(_delegates[src], _delegates[dst], amount);
+        uint256 u_amount = uint256(amount);
+        uint256 u_taxAmount = u_amount * TAX_PERCENT / 100;
+        uint256 u_burnAmount = u_taxAmount * BURN_PERCENT / TAX_PERCENT;
+        uint256 u_reflectionAmount = u_taxAmount * REFLECTION_PERCENT / TAX_PERCENT;
+        uint256 u_transferAmount = u_amount - u_taxAmount;
+
+        uint96 taxAmount = safe96(u_taxAmount, "SWITCH::taxAmount exceeds 96 bits");
+        uint96 burnAmount = safe96(u_burnAmount, "SWITCH::burnAmount exceeds 96 bits");
+        uint96 reflectionAmount = safe96(u_reflectionAmount, "SWITCH::reflectionAmount exceeds 96 bits");
+        uint96 transferAmount = safe96(u_transferAmount, "SWITCH::transferAmount exceeds 96 bits");
+
+        // Burn
+        _burn(src, burnAmount);
+        emit Burned(u_burnAmount);
+
+        // Reflection
+        _totalSupplyForReflection = sub96(_totalSupplyForReflection, reflectionAmount, "SWITCH::reflection underflow");
+        emit Reflected(u_reflectionAmount);
+
+        // Transfer the rest
+        _balances[src] = sub96(_balances[src], transferAmount, "SWITCH::_transferTokens: transfer amount exceeds balance");
+        _balances[dst] = add96(_balances[dst], transferAmount, "SWITCH::_transferTokens: transfer amount overflows");
+        emit Transfer(src, dst, transferAmount);
+
+        _moveDelegates(_delegates[src], _delegates[dst], transferAmount);
+
+        emit TaxTaken(src, dst, u_amount, u_taxAmount);
     }
 
     function _moveDelegates(address srcRep, address dstRep, uint96 amount) internal {
@@ -395,6 +440,12 @@ contract Switch is IERC20, Ownable {
         _balances[_account] = add96(_balances[_account], _amount, "SWITCH::mint: balance amount overflows");
         _moveDelegates(address(0), _delegates[_account], _amount);
         emit Transfer(address(0), _account, _amount);
+
+        if (_totalSupplyForReflection == 0) {
+            _totalSupplyForReflection = _totalSupply;
+            _excludedFromReflection[address(0)] = true;
+            _excludedFromReflection[owner()] = true;
+        }
     }
 
     /** @dev Destroys `amount` tokens from `account`, reducing the
@@ -437,5 +488,19 @@ contract Switch is IERC20, Ownable {
         uint256 chainId;
         assembly { chainId := chainid() }
         return chainId;
+    }
+
+    /**
+     * @dev Owner can update cooldown time for anti-bot.
+     */
+    function setCooldownTime(uint256 newCooldown) external onlyOwner {
+        cooldownTime = newCooldown;
+    }
+
+    /**
+     * @dev Owner can exclude/include addresses from reflection.
+     */
+    function setExcludedFromReflection(address account, bool excluded) external onlyOwner {
+        _excludedFromReflection[account] = excluded;
     }
 }
